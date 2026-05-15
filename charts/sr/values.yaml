@@ -1,0 +1,26 @@
+replicaCount: 1
+
+image:
+  repository: sr:local
+  pullPolicy: Always
+
+service:
+  type: LoadBalancer
+  port: 8080
+  annotations:
+    service.kubernetes.io/qcloud-loadbalancer-internal-subnetid: subnet-bldyjtgd
+
+resources:
+  requests:
+    cpu: "1"
+    memory: 1024Mi
+  limits:
+    cpu: "1"
+    memory: 1024Mi
+
+podSecurityContext:
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+serverKey: ""

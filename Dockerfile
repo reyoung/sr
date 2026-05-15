@@ -2,10 +2,13 @@ FROM golang:1.25.3-alpine AS build
 
 WORKDIR /src
 
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
 COPY go.mod ./
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/sr .
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/sr .
 
 FROM alpine:3.22
 
