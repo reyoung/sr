@@ -36,8 +36,11 @@ Bind an exposed service to a local listener:
 sr local-forward-listen --key client.key --serv some-serv-name --listen ${local_addr} --retry-interval 1s ${remote_ip}:${remote_port}
 ```
 
-All commands are blocking. For a single `sr server` instance, a service name can
-only have one active `local-forward-expose` process. `local-forward-listen`
-waits until the remote server can discover the requested service before binding
-the local listener, which helps deployment flows where the server endpoint is
-available before the exposing workload is ready.
+All commands are blocking. For a single `sr server` instance, each client key
+can only have one active `local-forward-expose` process for a service name.
+Different client keys can expose the same service name independently, and a
+`local-forward-listen` process only discovers services exposed by the same
+client key. `local-forward-listen` waits until the remote server can discover
+the requested service before binding the local listener, which helps deployment
+flows where the server endpoint is available before the exposing workload is
+ready.
