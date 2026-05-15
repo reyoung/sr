@@ -45,7 +45,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		if fs.NArg() != 2 {
 			return fmt.Errorf("usage: sr local-forward-expose --serv NAME [--key client.key] local_addr remote_addr")
 		}
-		return RunExpose(ctx, ExposeConfig{Service: *service, LocalAddr: fs.Arg(0), RemoteAddr: fs.Arg(1), KeyPath: *key})
+		return RunExpose(ctx, ExposeConfig{Service: *service, LocalAddr: fs.Arg(0), RemoteAddr: fs.Arg(1), KeyPath: *key, LogWriter: stderr})
 	case "local-forward-listen":
 		fs := flag.NewFlagSet("local-forward-listen", flag.ContinueOnError)
 		fs.SetOutput(stderr)

@@ -22,6 +22,7 @@ func TestForwardRoundTrip(t *testing.T) {
 	defer stopEcho()
 	serverAddr := freeAddr(t)
 	listenAddr := freeAddr(t)
+	exposeLogs := &safeBuffer{}
 
 	serverCtx, cancelServer := context.WithCancel(context.Background())
 	defer cancelServer()
@@ -36,7 +37,7 @@ func TestForwardRoundTrip(t *testing.T) {
 	exposeCtx, cancelExpose := context.WithCancel(context.Background())
 	defer cancelExpose()
 	go func() {
-		err := RunExpose(exposeCtx, ExposeConfig{Service: "echo", LocalAddr: echoAddr, RemoteAddr: serverAddr, KeyPath: clientKey})
+		err := RunExpose(exposeCtx, ExposeConfig{Service: "echo", LocalAddr: echoAddr, RemoteAddr: serverAddr, KeyPath: clientKey, LogWriter: exposeLogs})
 		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "use of closed network connection") {
 			t.Errorf("expose failed: %v", err)
 		}
@@ -68,6 +69,9 @@ func TestForwardRoundTrip(t *testing.T) {
 	if string(buf) != "hello sr" {
 		t.Fatalf("got %q", string(buf))
 	}
+	waitForLog(t, exposeLogs, "service echo exposed")
+	waitForLog(t, exposeLogs, "service echo link")
+	waitForLog(t, exposeLogs, "connected")
 }
 
 func TestDuplicateExposeRejected(t *testing.T) {
@@ -355,6 +359,18 @@ func (b *safeBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.b.String()
+}
+
+func waitForLog(t *testing.T, logs *safeBuffer, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(logs.String(), want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("missing log %q in %q", want, logs.String())
 }
 
 func startEchoServer(t *testing.T) (string, func()) {

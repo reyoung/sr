@@ -17,6 +17,7 @@ type ExposeConfig struct {
 	LocalAddr  string
 	RemoteAddr string
 	KeyPath    string
+	LogWriter  io.Writer
 }
 
 type ListenConfig struct {
@@ -57,6 +58,7 @@ func RunExpose(ctx context.Context, cfg ExposeConfig) error {
 		}
 		return fmt.Errorf("server rejected expose")
 	}
+	logExpose(cfg, "service %s exposed on %s; forwarding to %s", cfg.Service, cfg.RemoteAddr, cfg.LocalAddr)
 	go func() {
 		<-ctx.Done()
 		_ = conn.Close()
@@ -72,6 +74,7 @@ func RunExpose(ctx context.Context, cfg ExposeConfig) error {
 		if msg.Type != "connect" {
 			continue
 		}
+		logExpose(cfg, "service %s link %s requested", cfg.Service, msg.ID)
 		go exposeOne(ctx, tlsCfg, cfg, msg.ID)
 	}
 }
@@ -79,24 +82,36 @@ func RunExpose(ctx context.Context, cfg ExposeConfig) error {
 func exposeOne(ctx context.Context, tlsCfg *tls.Config, cfg ExposeConfig, id string) {
 	remote, err := tls.Dial("tcp", cfg.RemoteAddr, tlsCfg)
 	if err != nil {
+		logExpose(cfg, "service %s link %s failed to connect remote %s: %v", cfg.Service, id, cfg.RemoteAddr, err)
 		return
 	}
 	rjc := newJSONConn(remote)
 	if err := rjc.writeMessage(message{Type: "expose_stream", Service: cfg.Service, ID: id}); err != nil {
+		logExpose(cfg, "service %s link %s failed to start remote stream: %v", cfg.Service, id, err)
 		_ = remote.Close()
 		return
 	}
 	msg, err := rjc.readMessage()
 	if err != nil || msg.Type != "ok" {
+		if err != nil {
+			logExpose(cfg, "service %s link %s failed waiting for remote stream: %v", cfg.Service, id, err)
+		} else if msg.Error != "" {
+			logExpose(cfg, "service %s link %s rejected by remote: %s", cfg.Service, id, msg.Error)
+		} else {
+			logExpose(cfg, "service %s link %s rejected by remote", cfg.Service, id)
+		}
 		_ = remote.Close()
 		return
 	}
 	local, err := (&net.Dialer{}).DialContext(ctx, "tcp", cfg.LocalAddr)
 	if err != nil {
+		logExpose(cfg, "service %s link %s failed to connect local %s: %v", cfg.Service, id, cfg.LocalAddr, err)
 		_ = remote.Close()
 		return
 	}
+	logExpose(cfg, "service %s link %s connected: %s <-> %s", cfg.Service, id, cfg.RemoteAddr, cfg.LocalAddr)
 	pipePlainJSON(local, rjc)
+	logExpose(cfg, "service %s link %s closed", cfg.Service, id)
 }
 
 func RunListen(ctx context.Context, cfg ListenConfig) error {
@@ -189,14 +204,22 @@ func discoverRemoteService(tlsCfg *tls.Config, remoteAddr, service string) error
 }
 
 func logListen(cfg ListenConfig, format string, args ...any) {
-	if cfg.LogWriter == nil {
+	logLine(cfg.LogWriter, format, args...)
+}
+
+func logExpose(cfg ExposeConfig, format string, args ...any) {
+	logLine(cfg.LogWriter, format, args...)
+}
+
+func logLine(w io.Writer, format string, args ...any) {
+	if w == nil {
 		return
 	}
 	line := fmt.Sprintf(format, args...)
 	if !strings.HasSuffix(line, "\n") {
 		line += "\n"
 	}
-	_, _ = io.WriteString(cfg.LogWriter, line)
+	_, _ = io.WriteString(w, line)
 }
 
 func listenOne(tlsCfg *tls.Config, cfg ListenConfig, local net.Conn) {
