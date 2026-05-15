@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,10 +20,12 @@ type ExposeConfig struct {
 }
 
 type ListenConfig struct {
-	Service    string
-	ListenAddr string
-	RemoteAddr string
-	KeyPath    string
+	Service       string
+	ListenAddr    string
+	RemoteAddr    string
+	KeyPath       string
+	RetryInterval time.Duration
+	LogWriter     io.Writer
 }
 
 func RunExpose(ctx context.Context, cfg ExposeConfig) error {
@@ -104,6 +107,12 @@ func RunListen(ctx context.Context, cfg ListenConfig) error {
 	if err != nil {
 		return err
 	}
+	if cfg.RetryInterval <= 0 {
+		cfg.RetryInterval = time.Second
+	}
+	if err := waitForRemoteService(ctx, tlsCfg, cfg); err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return err
@@ -123,6 +132,71 @@ func RunListen(ctx context.Context, cfg ListenConfig) error {
 		}
 		go listenOne(tlsCfg, cfg, conn)
 	}
+}
+
+func waitForRemoteService(ctx context.Context, tlsCfg *tls.Config, cfg ListenConfig) error {
+	for {
+		err := discoverRemoteService(tlsCfg, cfg.RemoteAddr, cfg.Service)
+		if err == nil {
+			logListen(cfg, "service %s discovered on %s; listening on %s", cfg.Service, cfg.RemoteAddr, cfg.ListenAddr)
+			return nil
+		}
+		if !errors.Is(err, errServiceNotExposed) {
+			return err
+		}
+		logListen(cfg, "service %s is not exposed on %s; retrying in %s", cfg.Service, cfg.RemoteAddr, cfg.RetryInterval)
+		timer := time.NewTimer(cfg.RetryInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+var errServiceNotExposed = errors.New("service is not exposed")
+
+func discoverRemoteService(tlsCfg *tls.Config, remoteAddr, service string) error {
+	remote, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", remoteAddr, tlsCfg)
+	if err != nil {
+		return err
+	}
+	defer remote.Close()
+	rjc := newJSONConn(remote)
+	if err := rjc.writeMessage(message{Type: "discover", Service: service}); err != nil {
+		return err
+	}
+	msg, err := rjc.readMessage()
+	if err != nil {
+		return err
+	}
+	if msg.Type == "ok" {
+		return nil
+	}
+	if msg.Error == errServiceNotExposed.Error() {
+		return errServiceNotExposed
+	}
+	if msg.Error != "" {
+		return errors.New(msg.Error)
+	}
+	return fmt.Errorf("server rejected discover")
+}
+
+func logListen(cfg ListenConfig, format string, args ...any) {
+	if cfg.LogWriter == nil {
+		return
+	}
+	line := fmt.Sprintf(format, args...)
+	if !strings.HasSuffix(line, "\n") {
+		line += "\n"
+	}
+	_, _ = io.WriteString(cfg.LogWriter, line)
 }
 
 func listenOne(tlsCfg *tls.Config, cfg ListenConfig, local net.Conn) {

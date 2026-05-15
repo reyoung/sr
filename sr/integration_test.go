@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -102,6 +103,127 @@ func TestDuplicateExposeRejected(t *testing.T) {
 	}
 }
 
+func TestDiscoverDoesNotTriggerExposeConnect(t *testing.T) {
+	dir := t.TempDir()
+	serverKey, clientKey := writeTestKeys(t, dir)
+	serverAddr := freeAddr(t)
+
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	defer cancelServer()
+	go func() {
+		err := RunServer(serverCtx, ServerConfig{ListenAddr: serverAddr, KeyPath: serverKey})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("server failed: %v", err)
+		}
+	}()
+	waitTCP(t, serverAddr)
+
+	tlsCfg, err := LoadClientTLSConfig(clientKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exposeConn, err := tls.Dial("tcp", serverAddr, tlsCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exposeConn.Close()
+	exposeCtrl := newJSONConn(exposeConn)
+	if err := exposeCtrl.writeMessage(message{Type: "expose", Service: "discover-only"}); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := exposeCtrl.readMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Type != "ok" {
+		t.Fatalf("expected expose ok, got %#v", msg)
+	}
+
+	if err := discoverRemoteService(tlsCfg, serverAddr, "discover-only"); err != nil {
+		t.Fatal(err)
+	}
+	if err := exposeConn.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	msg, err = exposeCtrl.readMessage()
+	if err == nil {
+		t.Fatalf("discover unexpectedly triggered control message %#v", msg)
+	}
+	if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+		t.Fatalf("expected timeout waiting for control message, got %v", err)
+	}
+}
+
+func TestListenWaitsForExposeBeforeBinding(t *testing.T) {
+	dir := t.TempDir()
+	serverKey, clientKey := writeTestKeys(t, dir)
+	echoAddr, stopEcho := startEchoServer(t)
+	defer stopEcho()
+	serverAddr := freeAddr(t)
+	listenAddr := freeAddr(t)
+	logs := &safeBuffer{}
+
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	defer cancelServer()
+	go func() {
+		err := RunServer(serverCtx, ServerConfig{ListenAddr: serverAddr, KeyPath: serverKey})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("server failed: %v", err)
+		}
+	}()
+	waitTCP(t, serverAddr)
+
+	listenCtx, cancelListen := context.WithCancel(context.Background())
+	defer cancelListen()
+	go func() {
+		err := RunListen(listenCtx, ListenConfig{
+			Service:       "late",
+			ListenAddr:    listenAddr,
+			RemoteAddr:    serverAddr,
+			KeyPath:       clientKey,
+			RetryInterval: 25 * time.Millisecond,
+			LogWriter:     logs,
+		})
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Errorf("listen failed: %v", err)
+		}
+	}()
+	waitNoTCP(t, listenAddr, 150*time.Millisecond)
+
+	exposeCtx, cancelExpose := context.WithCancel(context.Background())
+	defer cancelExpose()
+	go func() {
+		err := RunExpose(exposeCtx, ExposeConfig{Service: "late", LocalAddr: echoAddr, RemoteAddr: serverAddr, KeyPath: clientKey})
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Errorf("expose failed: %v", err)
+		}
+	}()
+	waitTCP(t, listenAddr)
+
+	conn, err := net.Dial("tcp", listenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("late hello")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len("late hello"))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "late hello" {
+		t.Fatalf("got %q", string(buf))
+	}
+	logText := logs.String()
+	if !strings.Contains(logText, "service late is not exposed") {
+		t.Fatalf("missing retry log in %q", logText)
+	}
+	if !strings.Contains(logText, "service late discovered") {
+		t.Fatalf("missing discovered log in %q", logText)
+	}
+}
+
 func writeTestKeys(t *testing.T, dir string) (string, string) {
 	t.Helper()
 	serverBundle, err := GenerateServerBundle()
@@ -121,6 +243,23 @@ func writeTestKeys(t *testing.T, dir string) (string, string) {
 		t.Fatal(err)
 	}
 	return serverKey, clientKey
+}
+
+type safeBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
 }
 
 func startEchoServer(t *testing.T) (string, func()) {
@@ -162,6 +301,19 @@ func freeAddr(t *testing.T) string {
 	return addr
 }
 
+func waitNoTCP(t *testing.T, addr string, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 25*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			t.Fatalf("%s accepted TCP before service discovery", addr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func waitTCP(t *testing.T, addr string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -184,27 +336,11 @@ func waitForExpose(t *testing.T, keyPath, serverAddr, service string) {
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := tlsDial(serverAddr, tlsCfg)
-		if err != nil {
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-		jc := newJSONConn(conn)
-		if err := jc.writeMessage(message{Type: "listen_stream", Service: service}); err != nil {
-			_ = conn.Close()
-			time.Sleep(20 * time.Millisecond)
-			continue
-		}
-		msg, err := jc.readMessage()
-		_ = conn.Close()
-		if err == nil && (msg.Type == "ok" || msg.Error != "service is not exposed") {
+		err := discoverRemoteService(tlsCfg, serverAddr, service)
+		if err == nil {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for expose %s", service)
-}
-
-func tlsDial(addr string, cfg *tls.Config) (net.Conn, error) {
-	return tls.Dial("tcp", addr, cfg)
 }

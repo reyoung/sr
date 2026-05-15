@@ -28,3 +28,16 @@ func TestCLIGenKeyBundles(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestCLIRetryIntervalValidation(t *testing.T) {
+	err := Run(t.Context(), []string{
+		"local-forward-listen",
+		"--serv", "svc",
+		"--listen", "127.0.0.1:0",
+		"--retry-interval", "not-a-duration",
+		"127.0.0.1:1",
+	}, &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("expected invalid duration error")
+	}
+}

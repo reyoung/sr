@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"time"
 )
 
 const defaultKeyPath = "client.key"
@@ -51,6 +52,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		service := fs.String("serv", "", "service name")
 		listen := fs.String("listen", "", "local listen address")
 		key := fs.String("key", defaultKeyPath, "client key bundle")
+		retryInterval := fs.Duration("retry-interval", time.Second, "remote service discovery retry interval")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -61,9 +63,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("local-forward-listen requires --listen")
 		}
 		if fs.NArg() != 1 {
-			return fmt.Errorf("usage: sr local-forward-listen --serv NAME --listen local_addr [--key client.key] remote_addr")
+			return fmt.Errorf("usage: sr local-forward-listen --serv NAME --listen local_addr [--key client.key] [--retry-interval 1s] remote_addr")
 		}
-		return RunListen(ctx, ListenConfig{Service: *service, ListenAddr: *listen, RemoteAddr: fs.Arg(0), KeyPath: *key})
+		return RunListen(ctx, ListenConfig{Service: *service, ListenAddr: *listen, RemoteAddr: fs.Arg(0), KeyPath: *key, RetryInterval: *retryInterval, LogWriter: stderr})
 	default:
 		usage(stderr)
 		return fmt.Errorf("unknown command %q", args[0])
@@ -76,5 +78,5 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  sr gen-key --client server.key --label USER_NAME > client.key")
 	fmt.Fprintln(w, "  sr server --key server.key --listen remote_ip:remote_port")
 	fmt.Fprintln(w, "  sr local-forward-expose --key client.key --serv name local_ip:local_port remote_ip:remote_port")
-	fmt.Fprintln(w, "  sr local-forward-listen --key client.key --serv name --listen local_addr remote_ip:remote_port")
+	fmt.Fprintln(w, "  sr local-forward-listen --key client.key --serv name --listen local_addr --retry-interval 1s remote_ip:remote_port")
 }

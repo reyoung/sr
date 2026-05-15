@@ -65,6 +65,8 @@ func (s *serverState) handle(conn net.Conn) {
 	switch msg.Type {
 	case "expose":
 		s.handleExpose(jc, msg)
+	case "discover":
+		s.handleDiscover(jc, msg)
 	case "listen_stream":
 		s.handleListenStream(jc, msg)
 	case "expose_stream":
@@ -105,6 +107,24 @@ func (s *serverState) handleExpose(jc *jsonConn, msg message) {
 	}
 	close(ex.done)
 	s.mu.Unlock()
+	_ = jc.conn.Close()
+}
+
+func (s *serverState) handleDiscover(jc *jsonConn, msg message) {
+	if err := validateServiceName(msg.Service); err != nil {
+		_ = jc.writeMessage(message{Type: "error", Error: err.Error()})
+		_ = jc.conn.Close()
+		return
+	}
+	s.mu.Lock()
+	_, exists := s.exposers[msg.Service]
+	s.mu.Unlock()
+	if !exists {
+		_ = jc.writeMessage(message{Type: "error", Error: "service is not exposed"})
+		_ = jc.conn.Close()
+		return
+	}
+	_ = jc.writeMessage(message{Type: "ok"})
 	_ = jc.conn.Close()
 }
 
