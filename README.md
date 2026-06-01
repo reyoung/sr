@@ -27,7 +27,7 @@ sr server --key server.key --listen ${remote_ip}:${remote_port}
 Expose a local TCP service through the remote server:
 
 ```sh
-sr local-forward-expose --key client.key --serv some-serv-name ${local_ip}:${local_port} ${remote_ip}:${remote_port}
+sr local-forward-expose --key client.key --serv some-serv-name --retry-interval 1s ${local_ip}:${local_port} ${remote_ip}:${remote_port}
 ```
 
 Bind an exposed service to a local listener:

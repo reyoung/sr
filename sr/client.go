@@ -13,11 +13,12 @@ import (
 )
 
 type ExposeConfig struct {
-	Service    string
-	LocalAddr  string
-	RemoteAddr string
-	KeyPath    string
-	LogWriter  io.Writer
+	Service       string
+	LocalAddr     string
+	RemoteAddr    string
+	KeyPath       string
+	RetryInterval time.Duration
+	LogWriter     io.Writer
 }
 
 type ListenConfig struct {
@@ -37,45 +38,94 @@ func RunExpose(ctx context.Context, cfg ExposeConfig) error {
 	if err != nil {
 		return err
 	}
-	conn, err := tls.Dial("tcp", cfg.RemoteAddr, tlsCfg)
+	if cfg.RetryInterval <= 0 {
+		cfg.RetryInterval = time.Second
+	}
+	ctrl, conn, err := connectExposeControl(tlsCfg, cfg)
 	if err != nil {
 		return err
+	}
+	for {
+		logExpose(cfg, "service %s exposed on %s; forwarding to %s", cfg.Service, cfg.RemoteAddr, cfg.LocalAddr)
+		stopCloseOnDone := closeConnOnDone(ctx, conn)
+		msg, err := ctrl.readMessage()
+		for err == nil {
+			if msg.Type == "connect" {
+				logExpose(cfg, "service %s link %s requested", cfg.Service, msg.ID)
+				go exposeOne(ctx, tlsCfg, cfg, msg.ID)
+			}
+			msg, err = ctrl.readMessage()
+		}
+		stopCloseOnDone()
+		_ = conn.Close()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		logExpose(cfg, "service %s control connection closed from %s: %v; reconnecting in %s", cfg.Service, cfg.RemoteAddr, err, cfg.RetryInterval)
+		if err := waitRetry(ctx, cfg.RetryInterval); err != nil {
+			return err
+		}
+		ctrl, conn, err = connectExposeControl(tlsCfg, cfg)
+		for err != nil && ctx.Err() == nil {
+			logExpose(cfg, "service %s failed to re-expose on %s: %v; retrying in %s", cfg.Service, cfg.RemoteAddr, err, cfg.RetryInterval)
+			if err := waitRetry(ctx, cfg.RetryInterval); err != nil {
+				return err
+			}
+			ctrl, conn, err = connectExposeControl(tlsCfg, cfg)
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func connectExposeControl(tlsCfg *tls.Config, cfg ExposeConfig) (*jsonConn, net.Conn, error) {
+	conn, err := tls.Dial("tcp", cfg.RemoteAddr, tlsCfg)
+	if err != nil {
+		return nil, nil, err
 	}
 	ctrl := newJSONConn(conn)
 	if err := ctrl.writeMessage(message{Type: "expose", Service: cfg.Service}); err != nil {
 		_ = conn.Close()
-		return err
+		return nil, nil, err
 	}
 	msg, err := ctrl.readMessage()
 	if err != nil {
 		_ = conn.Close()
-		return err
+		return nil, nil, err
 	}
 	if msg.Type != "ok" {
 		_ = conn.Close()
 		if msg.Error != "" {
-			return errors.New(msg.Error)
+			return nil, nil, errors.New(msg.Error)
 		}
-		return fmt.Errorf("server rejected expose")
+		return nil, nil, fmt.Errorf("server rejected expose")
 	}
-	logExpose(cfg, "service %s exposed on %s; forwarding to %s", cfg.Service, cfg.RemoteAddr, cfg.LocalAddr)
+	return ctrl, conn, nil
+}
+
+func closeConnOnDone(ctx context.Context, conn net.Conn) func() {
+	done := make(chan struct{})
 	go func() {
-		<-ctx.Done()
-		_ = conn.Close()
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
 	}()
-	for {
-		msg, err := ctrl.readMessage()
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return err
-		}
-		if msg.Type != "connect" {
-			continue
-		}
-		logExpose(cfg, "service %s link %s requested", cfg.Service, msg.ID)
-		go exposeOne(ctx, tlsCfg, cfg, msg.ID)
+	return func() {
+		close(done)
+	}
+}
+
+func waitRetry(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -110,8 +160,8 @@ func exposeOne(ctx context.Context, tlsCfg *tls.Config, cfg ExposeConfig, id str
 		return
 	}
 	logExpose(cfg, "service %s link %s connected: %s <-> %s", cfg.Service, id, cfg.RemoteAddr, cfg.LocalAddr)
-	pipePlainJSON(local, rjc)
-	logExpose(cfg, "service %s link %s closed", cfg.Service, id)
+	stats := pipePlainJSON(local, rjc)
+	logExpose(cfg, "service %s link %s closed: remote_to_local_bytes=%d local_to_remote_bytes=%d remote_to_local_error=%v local_to_remote_error=%v", cfg.Service, id, stats.remoteToLocalBytes, stats.localToRemoteBytes, stats.remoteToLocalErr, stats.localToRemoteErr)
 }
 
 func RunListen(ctx context.Context, cfg ListenConfig) error {
@@ -243,19 +293,27 @@ func listenOne(tlsCfg *tls.Config, cfg ListenConfig, local net.Conn) {
 	pipePlainJSON(local, rjc)
 }
 
-func pipePlainJSON(plain net.Conn, jc *jsonConn) {
+type pipeStats struct {
+	remoteToLocalBytes int64
+	localToRemoteBytes int64
+	remoteToLocalErr   error
+	localToRemoteErr   error
+}
+
+func pipePlainJSON(plain net.Conn, jc *jsonConn) pipeStats {
+	var stats pipeStats
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(plain, jc.r)
+		stats.remoteToLocalBytes, stats.remoteToLocalErr = io.Copy(plain, jc.r)
 		if cw, ok := plain.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(jc.conn, plain)
+		stats.localToRemoteBytes, stats.localToRemoteErr = io.Copy(jc.conn, plain)
 		if cw, ok := jc.conn.(closeWriter); ok {
 			_ = cw.CloseWrite()
 		}
@@ -263,4 +321,5 @@ func pipePlainJSON(plain net.Conn, jc *jsonConn) {
 	wg.Wait()
 	_ = plain.Close()
 	_ = jc.conn.Close()
+	return stats
 }

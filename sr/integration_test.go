@@ -107,6 +107,77 @@ func TestDuplicateExposeRejected(t *testing.T) {
 	}
 }
 
+func TestExposeReconnectsAfterControlEOF(t *testing.T) {
+	dir := t.TempDir()
+	serverKey, clientKey := writeTestKeys(t, dir)
+	echoAddr, stopEcho := startEchoServer(t)
+	defer stopEcho()
+	serverAddr := freeAddr(t)
+	listenAddr := freeAddr(t)
+	exposeLogs := &safeBuffer{}
+
+	closedFirstControl := startOneShotExposeServer(t, serverAddr, serverKey)
+
+	exposeCtx, cancelExpose := context.WithCancel(context.Background())
+	defer cancelExpose()
+	go func() {
+		err := RunExpose(exposeCtx, ExposeConfig{
+			Service:       "reconnect",
+			LocalAddr:     echoAddr,
+			RemoteAddr:    serverAddr,
+			KeyPath:       clientKey,
+			RetryInterval: 25 * time.Millisecond,
+			LogWriter:     exposeLogs,
+		})
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Errorf("expose failed: %v", err)
+		}
+	}()
+	select {
+	case <-closedFirstControl:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for first expose control close")
+	}
+	waitForLog(t, exposeLogs, "control connection closed")
+
+	serverCtx, cancelServer := context.WithCancel(context.Background())
+	defer cancelServer()
+	go func() {
+		err := RunServer(serverCtx, ServerConfig{ListenAddr: serverAddr, KeyPath: serverKey})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Errorf("server failed: %v", err)
+		}
+	}()
+	waitTCP(t, serverAddr)
+	waitForExpose(t, clientKey, serverAddr, "reconnect")
+
+	listenCtx, cancelListen := context.WithCancel(context.Background())
+	defer cancelListen()
+	go func() {
+		err := RunListen(listenCtx, ListenConfig{Service: "reconnect", ListenAddr: listenAddr, RemoteAddr: serverAddr, KeyPath: clientKey})
+		if err != nil && !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "use of closed network connection") {
+			t.Errorf("listen failed: %v", err)
+		}
+	}()
+	waitTCP(t, listenAddr)
+
+	conn, err := net.Dial("tcp", listenAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("after eof")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len("after eof"))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "after eof" {
+		t.Fatalf("got %q", string(buf))
+	}
+}
+
 func TestServiceNamesScopedByClientKey(t *testing.T) {
 	dir := t.TempDir()
 	serverKey, clientAKey, clientBKey := writeTestKeysForLabels(t, dir, "client-a", "client-b")
@@ -397,6 +468,35 @@ func startEchoServer(t *testing.T) (string, func()) {
 		_ = ln.Close()
 		<-done
 	}
+}
+
+func startOneShotExposeServer(t *testing.T, addr, keyPath string) <-chan struct{} {
+	t.Helper()
+	tlsCfg, err := LoadServerTLSConfig(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", addr, tlsCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer ln.Close()
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		jc := newJSONConn(conn)
+		msg, err := jc.readMessage()
+		if err != nil || msg.Type != "expose" {
+			return
+		}
+		_ = jc.writeMessage(message{Type: "ok"})
+	}()
+	return done
 }
 
 func freeAddr(t *testing.T) string {

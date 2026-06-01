@@ -36,6 +36,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		fs.SetOutput(stderr)
 		service := fs.String("serv", "", "service name")
 		key := fs.String("key", defaultKeyPath, "client key bundle")
+		retryInterval := fs.Duration("retry-interval", time.Second, "remote expose reconnect retry interval")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -43,9 +44,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("local-forward-expose requires --serv")
 		}
 		if fs.NArg() != 2 {
-			return fmt.Errorf("usage: sr local-forward-expose --serv NAME [--key client.key] local_addr remote_addr")
+			return fmt.Errorf("usage: sr local-forward-expose --serv NAME [--key client.key] [--retry-interval 1s] local_addr remote_addr")
 		}
-		return RunExpose(ctx, ExposeConfig{Service: *service, LocalAddr: fs.Arg(0), RemoteAddr: fs.Arg(1), KeyPath: *key, LogWriter: stderr})
+		return RunExpose(ctx, ExposeConfig{Service: *service, LocalAddr: fs.Arg(0), RemoteAddr: fs.Arg(1), KeyPath: *key, RetryInterval: *retryInterval, LogWriter: stderr})
 	case "local-forward-listen":
 		fs := flag.NewFlagSet("local-forward-listen", flag.ContinueOnError)
 		fs.SetOutput(stderr)
@@ -77,6 +78,6 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  sr gen-key --server > server.key")
 	fmt.Fprintln(w, "  sr gen-key --client server.key --label USER_NAME > client.key")
 	fmt.Fprintln(w, "  sr server --key server.key --listen remote_ip:remote_port")
-	fmt.Fprintln(w, "  sr local-forward-expose --key client.key --serv name local_ip:local_port remote_ip:remote_port")
+	fmt.Fprintln(w, "  sr local-forward-expose --key client.key --serv name --retry-interval 1s local_ip:local_port remote_ip:remote_port")
 	fmt.Fprintln(w, "  sr local-forward-listen --key client.key --serv name --listen local_addr --retry-interval 1s remote_ip:remote_port")
 }
